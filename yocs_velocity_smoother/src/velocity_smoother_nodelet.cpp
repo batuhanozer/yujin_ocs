@@ -27,7 +27,7 @@
 
 #define PERIOD_RECORD_SIZE    5
 #define ZERO_VEL_COMMAND      geometry_msgs::Twist();
-#define IS_ZERO_VEOCITY(a)   ((a.linear.x == 0.0) && (a.angular.z == 0.0))
+#define IS_ZERO_VEOCITY(a)   ((a.linear.x == 0.0) && (a.linear.y == 0.0) && (a.angular.z == 0.0))
 
 /*****************************************************************************
 ** Namespaces
@@ -99,6 +99,8 @@ void VelocitySmoother::velocityCB(const geometry_msgs::Twist::ConstPtr& msg)
   locker.lock();
   target_vel.linear.x  =
       msg->linear.x  > 0.0 ? std::min(msg->linear.x,  speed_lim_v) : std::max(msg->linear.x,  -speed_lim_v);
+  target_vel.linear.y  =
+      msg->linear.y  > 0.0 ? std::min(msg->linear.y,  speed_lim_v) : std::max(msg->linear.y,  -speed_lim_v);
   target_vel.angular.z =
       msg->angular.z > 0.0 ? std::min(msg->angular.z, speed_lim_w) : std::max(msg->angular.z, -speed_lim_w);
   locker.unlock();
@@ -147,7 +149,7 @@ void VelocitySmoother::spin()
       if (IS_ZERO_VEOCITY(target_vel) == false)
       {
         ROS_WARN_STREAM("Velocity Smoother : input got inactive leaving us a non-zero target velocity ("
-              << target_vel.linear.x << ", " << target_vel.angular.z << "), zeroing...[" << name << "]");
+              << target_vel.linear.x << ", " << target_vel.linear.y << ", " << target_vel.angular.z << "), zeroing...[" << name << "]");
         target_vel = ZERO_VEL_COMMAND;
       }
     }
@@ -156,18 +158,22 @@ void VelocitySmoother::spin()
     //don't care about min / max velocities here, just for rough checking
     double period_buffer = 2.0;
 
-    double v_deviation_lower_bound = last_cmd_vel.linear.x - decel_lim_v_ * period * period_buffer;
-    double v_deviation_upper_bound = last_cmd_vel.linear.x + accel_lim_v_ * period * period_buffer;
+    double v_deviation_lower_bound_x = last_cmd_vel.linear.x - decel_lim_v_ * period * period_buffer;
+    double v_deviation_upper_bound_x = last_cmd_vel.linear.x + accel_lim_v_ * period * period_buffer;
+
+    double v_deviation_lower_bound_y = last_cmd_vel.linear.y - decel_lim_v_ * period * period_buffer;
+    double v_deviation_upper_bound_y = last_cmd_vel.linear.y + accel_lim_v_ * period * period_buffer;
 
     double w_deviation_lower_bound = last_cmd_vel.angular.z - decel_lim_w_ * period * period_buffer;
     double angular_max_deviation = last_cmd_vel.angular.z + accel_lim_w_ * period * period_buffer;
 
-    bool v_different_from_feedback = current_vel.linear.x < v_deviation_lower_bound || current_vel.linear.x > v_deviation_upper_bound;
+    bool v_different_from_feedback_x = current_vel.linear.x < v_deviation_lower_bound_x || current_vel.linear.x > v_deviation_upper_bound_x;
+    bool v_different_from_feedback_y = current_vel.linear.y < v_deviation_lower_bound_y || current_vel.linear.y > v_deviation_upper_bound_y;
     bool w_different_from_feedback = current_vel.angular.z < w_deviation_lower_bound || current_vel.angular.z > angular_max_deviation;
 
     if ((robot_feedback != NONE) && (input_active == true) && (cb_avg_time > 0.0) &&
         (((ros::Time::now() - last_cb_time).toSec() > 5.0*cb_avg_time)     || // 5 missing msgs
-            v_different_from_feedback || w_different_from_feedback))
+            v_different_from_feedback_x || v_different_from_feedback_y || w_different_from_feedback))
     {
       // If the publisher has been inactive for a while, or if our current commanding differs a lot
       // from robot velocity feedback, we cannot trust the former; relay on robot's feedback instead
@@ -180,6 +186,7 @@ void VelocitySmoother::spin()
                         " instead of last command: " <<
                         (ros::Time::now() - last_cb_time).toSec() << ", " <<
                         current_vel.linear.x  - last_cmd_vel.linear.x << ", " <<
+                        current_vel.linear.y  - last_cmd_vel.linear.y << ", " <<
                         current_vel.angular.z - last_cmd_vel.angular.z << ", [" << name << "]"
                         );
       }
@@ -189,22 +196,34 @@ void VelocitySmoother::spin()
     geometry_msgs::TwistPtr cmd_vel;
 
     if ((target_vel.linear.x  != last_cmd_vel.linear.x) ||
+        (target_vel.linear.y  != last_cmd_vel.linear.y) ||
         (target_vel.angular.z != last_cmd_vel.angular.z))
     {
       // Try to reach target velocity ensuring that we don't exceed the acceleration limits
       cmd_vel.reset(new geometry_msgs::Twist(target_vel));
 
-      double v_inc, w_inc, max_v_inc, max_w_inc;
+      double v_inc_x, v_inc_y, w_inc, max_v_inc_x, max_v_inc_y, max_w_inc;
 
-      v_inc = target_vel.linear.x - last_cmd_vel.linear.x;
+      v_inc_x = target_vel.linear.x - last_cmd_vel.linear.x;
       if ((robot_feedback == ODOMETRY) && (current_vel.linear.x*target_vel.linear.x < 0.0))
       {
         // countermarch (on robots with significant inertia; requires odometry feedback to be detected)
-        max_v_inc = decel_lim_v_*period;
+        max_v_inc_x = decel_lim_v_*period;
       }
       else
       {
-        max_v_inc = ((v_inc*target_vel.linear.x > 0.0)?accel_lim_v:decel_lim_v_)*period;
+        max_v_inc_x = ((v_inc_x*target_vel.linear.x > 0.0)?accel_lim_v:decel_lim_v_)*period;
+      }
+
+      v_inc_y = target_vel.linear.y - last_cmd_vel.linear.y;
+      if ((robot_feedback == ODOMETRY) && (current_vel.linear.y*target_vel.linear.y < 0.0))
+      {
+        // countermarch (on robots with significant inertia; requires odometry feedback to be detected)
+        max_v_inc_y = decel_lim_v_*period;
+      }
+      else
+      {
+        max_v_inc_y = ((v_inc_x*target_vel.linear.y > 0.0)?accel_lim_v:decel_lim_v_)*period;
       }
 
       w_inc = target_vel.angular.z - last_cmd_vel.angular.z;
@@ -221,30 +240,38 @@ void VelocitySmoother::spin()
       // Calculate and normalise vectors A (desired velocity increment) and B (maximum velocity increment),
       // where v acts as coordinate x and w as coordinate y; the sign of the angle from A to B determines
       // which velocity (v or w) must be overconstrained to keep the direction provided as command
-      double MA = sqrt(    v_inc *     v_inc +     w_inc *     w_inc);
-      double MB = sqrt(max_v_inc * max_v_inc + max_w_inc * max_w_inc);
+      double MA = sqrt(    v_inc_x *     v_inc_x/* + v_inc_y *     v_inc_y */ +   w_inc *     w_inc);
+      double MB = sqrt(max_v_inc_x * max_v_inc_x/* + max_v_inc_y * max_v_inc_y */ +  max_w_inc * max_w_inc);
 
-      double Av = std::abs(v_inc) / MA;
+      double Av_x = std::abs(v_inc_x) / MA;
+      // double Av_y = std::abs(v_inc_y) / MA;
       double Aw = std::abs(w_inc) / MA;
-      double Bv = max_v_inc / MB;
+      double Bv_x = max_v_inc_x / MB;
+      // double Bv_y = max_v_inc_y / MB;
       double Bw = max_w_inc / MB;
-      double theta = atan2(Bw, Bv) - atan2(Aw, Av);
+      double theta = atan2(Bw, Bv_x) - atan2(Aw, Av_x);
 
       if (theta < 0)
       {
         // overconstrain linear velocity
-        max_v_inc = (max_w_inc*std::abs(v_inc))/std::abs(w_inc);
+        max_v_inc_x = (max_w_inc*std::abs(v_inc_x))/std::abs(w_inc);
       }
       else
       {
         // overconstrain angular velocity
-        max_w_inc = (max_v_inc*std::abs(w_inc))/std::abs(v_inc);
+        max_w_inc = (max_v_inc_x*std::abs(w_inc))/std::abs(v_inc_x);
       }
 
-      if (std::abs(v_inc) > max_v_inc)
+      if (std::abs(v_inc_x) > max_v_inc_x)
       {
         // we must limit linear velocity
-        cmd_vel->linear.x  = last_cmd_vel.linear.x  + sign(v_inc)*max_v_inc;
+        cmd_vel->linear.x  = last_cmd_vel.linear.x  + sign(v_inc_x)*max_v_inc_x;
+      }
+
+      if (std::abs(v_inc_y) > max_v_inc_y)
+      {
+        // we must limit linear velocity
+        cmd_vel->linear.y  = last_cmd_vel.linear.y  + sign(v_inc_y)*max_v_inc_y;
       }
 
       if (std::abs(w_inc) > max_w_inc)
